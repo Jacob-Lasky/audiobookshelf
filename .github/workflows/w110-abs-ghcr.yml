@@ -1,0 +1,102 @@
+name: Build reviewed W110 ABS image
+
+# Application revision is deliberately fixed: no arbitrary ref or tag inputs.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: w110-abs-c589465cca8e92e42cb3d6147938561829702df2
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Jacob-Lasky/audiobookshelf' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_REVISION: c589465cca8e92e42cb3d6147938561829702df2
+      IMAGE: ghcr.io/jacob-lasky/audiobookshelf
+      REVISION_TAG: w110-abs-c589465cca8e92e42cb3d6147938561829702df2
+    steps:
+      - name: Check out reviewed application source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Jacob-Lasky/audiobookshelf
+          ref: c589465cca8e92e42cb3d6147938561829702df2
+          persist-credentials: false
+      - name: Verify source and GPL license
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          printf '%s  %s\n' \
+            'ad392ba9faeaa2399af8a0bcec131b9cbb1bfe4551f6493381d8e812ed5a18c7' \
+            server/managers/BackupManager.js | sha256sum --check --strict
+          printf '%s  %s\n' '67bc57299ed0387354c5d421e1dd052c568457f6e834ba3be6b979827a0161b7' LICENSE | sha256sum --check --strict
+          printf '%s  %s\n' '0a3d7c59e872a963cc760365f63f4499339beec052735d6e942f8846bb8c39c5' Dockerfile | sha256sum --check --strict
+          git diff --exit-code
+      - name: Refuse replacement of revision tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, urllib.error, urllib.request
+          basic = base64.b64encode((os.environ['GH_ACTOR'] + ':' + os.environ['GH_TOKEN']).encode()).decode()
+          auth = urllib.request.Request(
+              'https://ghcr.io/token?service=ghcr.io&scope=repository:jacob-lasky/audiobookshelf:pull',
+              headers={'Authorization': 'Basic ' + basic})
+          with urllib.request.urlopen(auth, timeout=30) as response:
+              token = json.load(response)['token']
+          manifest = urllib.request.Request(
+              'https://ghcr.io/v2/jacob-lasky/audiobookshelf/manifests/' + os.environ['REVISION_TAG'],
+              method='HEAD', headers={'Authorization': 'Bearer ' + token,
+                                     'Accept': 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
+          try:
+              with urllib.request.urlopen(manifest, timeout=30):
+                  raise SystemExit('Revision tag already exists; refusing overwrite')
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit('Registry absence check refused: HTTP ' + str(error.code)) from None
+          print('Revision tag absent; one publication permitted')
+          PY
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to own GHCR namespace
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and publish exact reviewed source
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.REVISION_TAG }}
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/Jacob-Lasky/audiobookshelf
+            org.opencontainers.image.revision=c589465cca8e92e42cb3d6147938561829702df2
+            org.opencontainers.image.licenses=GPL-3.0
+            org.opencontainers.image.url=https://github.com/Jacob-Lasky/audiobookshelf/tree/c589465cca8e92e42cb3d6147938561829702df2
+      - name: Record immutable image digest and source
+        shell: bash
+        env:
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'Image: `%s@%s`\n\nSource: `%s`\n\nGPL source: https://github.com/Jacob-Lasky/audiobookshelf/tree/%s\n' \
+            "$IMAGE" "$BUILT_DIGEST" "$SOURCE_REVISION" "$SOURCE_REVISION" >> "$GITHUB_STEP_SUMMARY"
