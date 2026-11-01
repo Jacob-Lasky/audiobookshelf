@@ -1,5 +1,6 @@
 const sqlite3 = require('sqlite3')
 const Path = require('path')
+const { setImmediate } = require('node:timers')
 const Logger = require('../Logger')
 const SocketAuthority = require('../SocketAuthority')
 const Database = require('../Database')
@@ -406,25 +407,94 @@ class BackupManager {
    * @param {Backup} backup
    */
   backupSqliteDb(backup) {
-    const db = new sqlite3.Database(Database.dbPath)
     const dbFilePath = Path.join(global.ConfigPath, `absdatabase.${backup.id}.sqlite`)
-    return new Promise(async (resolve, reject) => {
-      const backup = db.backup(dbFilePath)
-      backup.step(-1)
-      backup.finish()
-
-      // Max time ~2 mins
-      for (let i = 0; i < 240; i++) {
-        if (backup.completed) {
-          return resolve(dbFilePath)
-        } else if (backup.failed) {
-          return reject(backup.message || 'Unknown failure reason')
-        }
-        await new Promise((r) => setTimeout(r, 500))
+    return new Promise((resolve, reject) => {
+      let transfer
+      let initialized = false
+      let opening = true
+      let initializing = false
+      let finishing = false
+      let closing = false
+      let settled = false
+      let failure
+      const rememberError = (error) => {
+        if (!settled && error && !failure) failure = error
       }
-
-      Logger.error(`[BackupManager] Backup sqlite timed out`)
-      reject('Backup timed out')
+      const close = () => {
+        if (closing) return
+        closing = true
+        const complete = async (error) => {
+          if (settled) return
+          // Mark before asynchronous removal so duplicate callbacks cannot settle twice.
+          settled = true
+          if (error && !failure) failure = error
+          if (failure) {
+            try {
+              await fs.remove(dbFilePath)
+            } catch (cleanupError) {
+              Logger.error('[BackupManager] Failed to remove incomplete sqlite backup', cleanupError)
+            }
+            reject(failure)
+          } else {
+            resolve(dbFilePath)
+          }
+        }
+        try {
+          db.close(complete)
+        } catch (error) {
+          complete(error)
+        }
+      }
+      const finish = (error) => {
+        rememberError(error)
+        if (finishing || opening || initializing) return
+        finishing = true
+        clearTimeout(timer)
+        if (!initialized) {
+          // sqlite3 finishes a failed initialization itself before the next turn.
+          return setImmediate(close)
+        }
+        try {
+          transfer.finish((finishError) => {
+            rememberError(finishError)
+            close()
+          })
+        } catch (finishError) {
+          rememberError(finishError)
+          close()
+        }
+      }
+      const timer = setTimeout(() => finish(new Error('Backup timed out')), 120000)
+      const db = new sqlite3.Database(Database.dbPath, (openError) => {
+        opening = false
+        if (openError || failure) return finish(openError)
+        try {
+          initializing = true
+          transfer = db.backup(dbFilePath, (initError) => {
+            initializing = false
+            initialized = !initError
+            if (initError || failure) return finish(initError)
+            try {
+              transfer.step(-1, (stepError, completed) => {
+                if (finishing) return
+                if (stepError) return finish(stepError)
+                if (!completed || !transfer.completed || transfer.failed) {
+                  return finish(new Error('SQLite backup did not complete'))
+                }
+                finish()
+              })
+            } catch (stepError) {
+              finish(stepError)
+            }
+          })
+          // Keep this listener for late native errors, including during finish/close.
+          transfer.on('error', finish)
+        } catch (initError) {
+          initializing = false
+          finish(initError)
+        }
+      })
+      db.on('error', finish)
     })
   }
 
